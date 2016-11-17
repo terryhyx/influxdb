@@ -10,6 +10,8 @@ import (
 	"sort"
 	"sync"
 
+	"github.com/influxdata/influxdb/pkg/estimator/hll"
+
 	"github.com/influxdata/influxdb/influxql"
 	"github.com/influxdata/influxdb/models"
 	"github.com/influxdata/influxdb/pkg/bytesutil"
@@ -514,10 +516,24 @@ func (i *Index) SeriesSketches() (estimator.Sketch, estimator.Sketch, error) {
 
 }
 
+// MeasurementsSketches returns the two sketches for the index by merging all
+// instances of the type sketch types in all the indexes files.
 func (i *Index) MeasurementsSketches() (estimator.Sketch, estimator.Sketch, error) {
-	//FIXME(edd)
-	return nil, nil, fmt.Errorf("MeasurementSketches not implemented")
+	var (
+		sketch  estimator.Sketch = hll.NewDefaultPlus()
+		tsketch estimator.Sketch = hll.NewDefaultPlus()
+	)
 
+	// Iterate over all the index files and merge all the sketches.
+	for _, f := range i.indexFiles {
+		if err := sketch.Merge(f.mblk.sketch); err != nil {
+			return nil, nil, err
+		}
+		if err := tsketch.Merge(f.mblk.tsketch); err != nil {
+			return nil, nil, err
+		}
+	}
+	return sketch, tsketch, nil
 }
 
 // Dereference is a nop.
