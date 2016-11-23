@@ -2,7 +2,6 @@ package influxql
 
 import (
 	"container/heap"
-	"errors"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -548,10 +547,6 @@ func (itr *{{$k.name}}LimitIterator) Next() (*{{$k.Name}}Point, error) {
 
 		// Read next point if we're beyond the limit.
 		if itr.opt.Limit > 0 && (itr.n-itr.opt.Offset) > itr.opt.Limit {
-			// If there's no interval, no groups, and a single source then simply exit.
-			if itr.opt.Interval.IsZero() && len(itr.opt.Dimensions) == 0 && len(itr.opt.Sources) == 1 {
-				return nil, nil
-			}
 			continue
 		}
 
@@ -841,7 +836,7 @@ type aux{{$k.Name}}Point struct {
 type {{$k.name}}AuxIterator struct {
 	input      *buf{{$k.Name}}Iterator
 	output     chan aux{{$k.Name}}Point
-	fields     auxIteratorFields
+	fields     *auxIteratorFields
 	background bool
 }
 
@@ -867,28 +862,6 @@ func (itr *{{$k.name}}AuxIterator) Next() (*{{$k.Name}}Point, error) {
 	return p.point, p.err
 }
 func (itr *{{$k.name}}AuxIterator) Iterator(name string, typ DataType) Iterator    { return itr.fields.iterator(name, typ) }
-
-func (itr *{{$k.name}}AuxIterator) CreateIterator(opt IteratorOptions) (Iterator, error) {
-	expr := opt.Expr
-	if expr == nil {
-		panic("unable to create an iterator with no expression from an aux iterator")
-	}
-
-	switch expr := expr.(type) {
-	case *VarRef:
-		return itr.Iterator(expr.Val, expr.Type), nil
-	default:
-		panic(fmt.Sprintf("invalid expression type for an aux iterator: %T", expr))
-	}
-}
-
-func (itr *{{$k.name}}AuxIterator) FieldDimensions(sources Sources) (fields map[string]DataType, dimensions map[string]struct{}, err error) {
-	return nil, nil, errors.New("not implemented")
-}
-
-func (itr *{{$k.name}}AuxIterator) ExpandSources(sources Sources) (Sources, error) {
-	return nil, errors.New("not implemented")
-}
 
 func (itr *{{.name}}AuxIterator) stream() {
 	for {
@@ -1016,8 +989,18 @@ func (itr *{{$k.name}}ChanIterator) Next() (*{{$k.Name}}Point, error) {
 type {{$k.name}}Reduce{{$v.Name}}Iterator struct {
 	input    *buf{{$k.Name}}Iterator
 	create   func() ({{$k.Name}}PointAggregator, {{$v.Name}}PointEmitter)
+	dims     []string
 	opt      IteratorOptions
 	points   []{{$v.Name}}Point
+}
+
+func new{{$k.Name}}Reduce{{$v.Name}}Iterator(input {{$k.Name}}Iterator, opt IteratorOptions, createFn func() ({{$k.Name}}PointAggregator, {{$v.Name}}PointEmitter)) *{{$k.name}}Reduce{{$v.Name}}Iterator {
+	return &{{$k.name}}Reduce{{$v.Name}}Iterator{
+		input:  newBuf{{$k.Name}}Iterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -1055,11 +1038,20 @@ type {{$k.name}}Reduce{{$v.Name}}Point struct {
 // The previous value for the dimension is passed to fn.
 func (itr *{{$k.name}}Reduce{{$v.Name}}Iterator) reduce() ([]{{$v.Name}}Point, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*{{$k.name}}Reduce{{$v.Name}}Point)
@@ -1073,7 +1065,7 @@ func (itr *{{$k.name}}Reduce{{$v.Name}}Iterator) reduce() ([]{{$v.Name}}Point, e
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -1084,7 +1076,7 @@ func (itr *{{$k.name}}Reduce{{$v.Name}}Iterator) reduce() ([]{{$v.Name}}Point, e
 		rp := m[id]
 		if rp == nil {
 			aggregator, emitter := itr.create()
-			rp = &{{$k.name}}Reduce{{.Name}}Point{
+			rp = &{{$k.name}}Reduce{{$v.Name}}Point{
 				Name:       curr.Name,
 				Tags:       tags,
 				Aggregator: aggregator,
@@ -1104,6 +1096,7 @@ func (itr *{{$k.name}}Reduce{{$v.Name}}Iterator) reduce() ([]{{$v.Name}}Point, e
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]{{$v.Name}}Point, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -1114,9 +1107,16 @@ func (itr *{{$k.name}}Reduce{{$v.Name}}Iterator) reduce() ([]{{$v.Name}}Point, e
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse({{$v.name}}PointsByTime(a)))
 	}
 
 	return a, nil
@@ -1126,6 +1126,7 @@ func (itr *{{$k.name}}Reduce{{$v.Name}}Iterator) reduce() ([]{{$v.Name}}Point, e
 type {{$k.name}}Stream{{$v.Name}}Iterator struct {
 	input  *buf{{$k.Name}}Iterator
 	create func() ({{$k.Name}}PointAggregator, {{$v.Name}}PointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*{{$k.name}}Reduce{{$v.Name}}Point
 	points []{{$v.Name}}Point
@@ -1136,6 +1137,7 @@ func new{{$k.Name}}Stream{{$v.Name}}Iterator(input {{$k.Name}}Iterator, createFn
 	return &{{$k.name}}Stream{{$v.Name}}Iterator{
 		input:  newBuf{{$k.Name}}Iterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*{{$k.name}}Reduce{{$v.Name}}Point),
 	}
@@ -1175,7 +1177,7 @@ func (itr *{{$k.name}}Stream{{$v.Name}}Iterator) reduce() ([]{{$v.Name}}Point, e
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {

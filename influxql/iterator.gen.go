@@ -9,7 +9,6 @@ package influxql
 import (
 	"container/heap"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -550,10 +549,6 @@ func (itr *floatLimitIterator) Next() (*FloatPoint, error) {
 
 		// Read next point if we're beyond the limit.
 		if itr.opt.Limit > 0 && (itr.n-itr.opt.Offset) > itr.opt.Limit {
-			// If there's no interval, no groups, and a single source then simply exit.
-			if itr.opt.Interval.IsZero() && len(itr.opt.Dimensions) == 0 && len(itr.opt.Sources) == 1 {
-				return nil, nil
-			}
 			continue
 		}
 
@@ -840,7 +835,7 @@ type auxFloatPoint struct {
 type floatAuxIterator struct {
 	input      *bufFloatIterator
 	output     chan auxFloatPoint
-	fields     auxIteratorFields
+	fields     *auxIteratorFields
 	background bool
 }
 
@@ -867,28 +862,6 @@ func (itr *floatAuxIterator) Next() (*FloatPoint, error) {
 }
 func (itr *floatAuxIterator) Iterator(name string, typ DataType) Iterator {
 	return itr.fields.iterator(name, typ)
-}
-
-func (itr *floatAuxIterator) CreateIterator(opt IteratorOptions) (Iterator, error) {
-	expr := opt.Expr
-	if expr == nil {
-		panic("unable to create an iterator with no expression from an aux iterator")
-	}
-
-	switch expr := expr.(type) {
-	case *VarRef:
-		return itr.Iterator(expr.Val, expr.Type), nil
-	default:
-		panic(fmt.Sprintf("invalid expression type for an aux iterator: %T", expr))
-	}
-}
-
-func (itr *floatAuxIterator) FieldDimensions(sources Sources) (fields map[string]DataType, dimensions map[string]struct{}, err error) {
-	return nil, nil, errors.New("not implemented")
-}
-
-func (itr *floatAuxIterator) ExpandSources(sources Sources) (Sources, error) {
-	return nil, errors.New("not implemented")
 }
 
 func (itr *floatAuxIterator) stream() {
@@ -1015,8 +988,18 @@ func (itr *floatChanIterator) Next() (*FloatPoint, error) {
 type floatReduceFloatIterator struct {
 	input  *bufFloatIterator
 	create func() (FloatPointAggregator, FloatPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []FloatPoint
+}
+
+func newFloatReduceFloatIterator(input FloatIterator, opt IteratorOptions, createFn func() (FloatPointAggregator, FloatPointEmitter)) *floatReduceFloatIterator {
+	return &floatReduceFloatIterator{
+		input:  newBufFloatIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -1054,11 +1037,20 @@ type floatReduceFloatPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *floatReduceFloatIterator) reduce() ([]FloatPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*floatReduceFloatPoint)
@@ -1072,7 +1064,7 @@ func (itr *floatReduceFloatIterator) reduce() ([]FloatPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -1103,6 +1095,7 @@ func (itr *floatReduceFloatIterator) reduce() ([]FloatPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]FloatPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -1113,9 +1106,16 @@ func (itr *floatReduceFloatIterator) reduce() ([]FloatPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(floatPointsByTime(a)))
 	}
 
 	return a, nil
@@ -1125,6 +1125,7 @@ func (itr *floatReduceFloatIterator) reduce() ([]FloatPoint, error) {
 type floatStreamFloatIterator struct {
 	input  *bufFloatIterator
 	create func() (FloatPointAggregator, FloatPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*floatReduceFloatPoint
 	points []FloatPoint
@@ -1135,6 +1136,7 @@ func newFloatStreamFloatIterator(input FloatIterator, createFn func() (FloatPoin
 	return &floatStreamFloatIterator{
 		input:  newBufFloatIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*floatReduceFloatPoint),
 	}
@@ -1174,7 +1176,7 @@ func (itr *floatStreamFloatIterator) reduce() ([]FloatPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -1319,8 +1321,18 @@ type floatExprFunc func(a, b float64) float64
 type floatReduceIntegerIterator struct {
 	input  *bufFloatIterator
 	create func() (FloatPointAggregator, IntegerPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []IntegerPoint
+}
+
+func newFloatReduceIntegerIterator(input FloatIterator, opt IteratorOptions, createFn func() (FloatPointAggregator, IntegerPointEmitter)) *floatReduceIntegerIterator {
+	return &floatReduceIntegerIterator{
+		input:  newBufFloatIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -1358,11 +1370,20 @@ type floatReduceIntegerPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *floatReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*floatReduceIntegerPoint)
@@ -1376,7 +1397,7 @@ func (itr *floatReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -1407,6 +1428,7 @@ func (itr *floatReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]IntegerPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -1417,9 +1439,16 @@ func (itr *floatReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(integerPointsByTime(a)))
 	}
 
 	return a, nil
@@ -1429,6 +1458,7 @@ func (itr *floatReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 type floatStreamIntegerIterator struct {
 	input  *bufFloatIterator
 	create func() (FloatPointAggregator, IntegerPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*floatReduceIntegerPoint
 	points []IntegerPoint
@@ -1439,6 +1469,7 @@ func newFloatStreamIntegerIterator(input FloatIterator, createFn func() (FloatPo
 	return &floatStreamIntegerIterator{
 		input:  newBufFloatIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*floatReduceIntegerPoint),
 	}
@@ -1478,7 +1509,7 @@ func (itr *floatStreamIntegerIterator) reduce() ([]IntegerPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -1627,8 +1658,18 @@ type floatIntegerExprFunc func(a, b float64) int64
 type floatReduceStringIterator struct {
 	input  *bufFloatIterator
 	create func() (FloatPointAggregator, StringPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []StringPoint
+}
+
+func newFloatReduceStringIterator(input FloatIterator, opt IteratorOptions, createFn func() (FloatPointAggregator, StringPointEmitter)) *floatReduceStringIterator {
+	return &floatReduceStringIterator{
+		input:  newBufFloatIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -1666,11 +1707,20 @@ type floatReduceStringPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *floatReduceStringIterator) reduce() ([]StringPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*floatReduceStringPoint)
@@ -1684,7 +1734,7 @@ func (itr *floatReduceStringIterator) reduce() ([]StringPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -1715,6 +1765,7 @@ func (itr *floatReduceStringIterator) reduce() ([]StringPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]StringPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -1725,9 +1776,16 @@ func (itr *floatReduceStringIterator) reduce() ([]StringPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(stringPointsByTime(a)))
 	}
 
 	return a, nil
@@ -1737,6 +1795,7 @@ func (itr *floatReduceStringIterator) reduce() ([]StringPoint, error) {
 type floatStreamStringIterator struct {
 	input  *bufFloatIterator
 	create func() (FloatPointAggregator, StringPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*floatReduceStringPoint
 	points []StringPoint
@@ -1747,6 +1806,7 @@ func newFloatStreamStringIterator(input FloatIterator, createFn func() (FloatPoi
 	return &floatStreamStringIterator{
 		input:  newBufFloatIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*floatReduceStringPoint),
 	}
@@ -1786,7 +1846,7 @@ func (itr *floatStreamStringIterator) reduce() ([]StringPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -1935,8 +1995,18 @@ type floatStringExprFunc func(a, b float64) string
 type floatReduceBooleanIterator struct {
 	input  *bufFloatIterator
 	create func() (FloatPointAggregator, BooleanPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []BooleanPoint
+}
+
+func newFloatReduceBooleanIterator(input FloatIterator, opt IteratorOptions, createFn func() (FloatPointAggregator, BooleanPointEmitter)) *floatReduceBooleanIterator {
+	return &floatReduceBooleanIterator{
+		input:  newBufFloatIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -1974,11 +2044,20 @@ type floatReduceBooleanPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *floatReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*floatReduceBooleanPoint)
@@ -1992,7 +2071,7 @@ func (itr *floatReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -2023,6 +2102,7 @@ func (itr *floatReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]BooleanPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -2033,9 +2113,16 @@ func (itr *floatReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(booleanPointsByTime(a)))
 	}
 
 	return a, nil
@@ -2045,6 +2132,7 @@ func (itr *floatReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 type floatStreamBooleanIterator struct {
 	input  *bufFloatIterator
 	create func() (FloatPointAggregator, BooleanPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*floatReduceBooleanPoint
 	points []BooleanPoint
@@ -2055,6 +2143,7 @@ func newFloatStreamBooleanIterator(input FloatIterator, createFn func() (FloatPo
 	return &floatStreamBooleanIterator{
 		input:  newBufFloatIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*floatReduceBooleanPoint),
 	}
@@ -2094,7 +2183,7 @@ func (itr *floatStreamBooleanIterator) reduce() ([]BooleanPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -2912,10 +3001,6 @@ func (itr *integerLimitIterator) Next() (*IntegerPoint, error) {
 
 		// Read next point if we're beyond the limit.
 		if itr.opt.Limit > 0 && (itr.n-itr.opt.Offset) > itr.opt.Limit {
-			// If there's no interval, no groups, and a single source then simply exit.
-			if itr.opt.Interval.IsZero() && len(itr.opt.Dimensions) == 0 && len(itr.opt.Sources) == 1 {
-				return nil, nil
-			}
 			continue
 		}
 
@@ -3202,7 +3287,7 @@ type auxIntegerPoint struct {
 type integerAuxIterator struct {
 	input      *bufIntegerIterator
 	output     chan auxIntegerPoint
-	fields     auxIteratorFields
+	fields     *auxIteratorFields
 	background bool
 }
 
@@ -3229,28 +3314,6 @@ func (itr *integerAuxIterator) Next() (*IntegerPoint, error) {
 }
 func (itr *integerAuxIterator) Iterator(name string, typ DataType) Iterator {
 	return itr.fields.iterator(name, typ)
-}
-
-func (itr *integerAuxIterator) CreateIterator(opt IteratorOptions) (Iterator, error) {
-	expr := opt.Expr
-	if expr == nil {
-		panic("unable to create an iterator with no expression from an aux iterator")
-	}
-
-	switch expr := expr.(type) {
-	case *VarRef:
-		return itr.Iterator(expr.Val, expr.Type), nil
-	default:
-		panic(fmt.Sprintf("invalid expression type for an aux iterator: %T", expr))
-	}
-}
-
-func (itr *integerAuxIterator) FieldDimensions(sources Sources) (fields map[string]DataType, dimensions map[string]struct{}, err error) {
-	return nil, nil, errors.New("not implemented")
-}
-
-func (itr *integerAuxIterator) ExpandSources(sources Sources) (Sources, error) {
-	return nil, errors.New("not implemented")
 }
 
 func (itr *integerAuxIterator) stream() {
@@ -3374,8 +3437,18 @@ func (itr *integerChanIterator) Next() (*IntegerPoint, error) {
 type integerReduceFloatIterator struct {
 	input  *bufIntegerIterator
 	create func() (IntegerPointAggregator, FloatPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []FloatPoint
+}
+
+func newIntegerReduceFloatIterator(input IntegerIterator, opt IteratorOptions, createFn func() (IntegerPointAggregator, FloatPointEmitter)) *integerReduceFloatIterator {
+	return &integerReduceFloatIterator{
+		input:  newBufIntegerIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -3413,11 +3486,20 @@ type integerReduceFloatPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *integerReduceFloatIterator) reduce() ([]FloatPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*integerReduceFloatPoint)
@@ -3431,7 +3513,7 @@ func (itr *integerReduceFloatIterator) reduce() ([]FloatPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -3462,6 +3544,7 @@ func (itr *integerReduceFloatIterator) reduce() ([]FloatPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]FloatPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -3472,9 +3555,16 @@ func (itr *integerReduceFloatIterator) reduce() ([]FloatPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(floatPointsByTime(a)))
 	}
 
 	return a, nil
@@ -3484,6 +3574,7 @@ func (itr *integerReduceFloatIterator) reduce() ([]FloatPoint, error) {
 type integerStreamFloatIterator struct {
 	input  *bufIntegerIterator
 	create func() (IntegerPointAggregator, FloatPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*integerReduceFloatPoint
 	points []FloatPoint
@@ -3494,6 +3585,7 @@ func newIntegerStreamFloatIterator(input IntegerIterator, createFn func() (Integ
 	return &integerStreamFloatIterator{
 		input:  newBufIntegerIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*integerReduceFloatPoint),
 	}
@@ -3533,7 +3625,7 @@ func (itr *integerStreamFloatIterator) reduce() ([]FloatPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -3682,8 +3774,18 @@ type integerFloatExprFunc func(a, b int64) float64
 type integerReduceIntegerIterator struct {
 	input  *bufIntegerIterator
 	create func() (IntegerPointAggregator, IntegerPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []IntegerPoint
+}
+
+func newIntegerReduceIntegerIterator(input IntegerIterator, opt IteratorOptions, createFn func() (IntegerPointAggregator, IntegerPointEmitter)) *integerReduceIntegerIterator {
+	return &integerReduceIntegerIterator{
+		input:  newBufIntegerIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -3721,11 +3823,20 @@ type integerReduceIntegerPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *integerReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*integerReduceIntegerPoint)
@@ -3739,7 +3850,7 @@ func (itr *integerReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -3770,6 +3881,7 @@ func (itr *integerReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]IntegerPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -3780,9 +3892,16 @@ func (itr *integerReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(integerPointsByTime(a)))
 	}
 
 	return a, nil
@@ -3792,6 +3911,7 @@ func (itr *integerReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 type integerStreamIntegerIterator struct {
 	input  *bufIntegerIterator
 	create func() (IntegerPointAggregator, IntegerPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*integerReduceIntegerPoint
 	points []IntegerPoint
@@ -3802,6 +3922,7 @@ func newIntegerStreamIntegerIterator(input IntegerIterator, createFn func() (Int
 	return &integerStreamIntegerIterator{
 		input:  newBufIntegerIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*integerReduceIntegerPoint),
 	}
@@ -3841,7 +3962,7 @@ func (itr *integerStreamIntegerIterator) reduce() ([]IntegerPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -3986,8 +4107,18 @@ type integerExprFunc func(a, b int64) int64
 type integerReduceStringIterator struct {
 	input  *bufIntegerIterator
 	create func() (IntegerPointAggregator, StringPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []StringPoint
+}
+
+func newIntegerReduceStringIterator(input IntegerIterator, opt IteratorOptions, createFn func() (IntegerPointAggregator, StringPointEmitter)) *integerReduceStringIterator {
+	return &integerReduceStringIterator{
+		input:  newBufIntegerIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -4025,11 +4156,20 @@ type integerReduceStringPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *integerReduceStringIterator) reduce() ([]StringPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*integerReduceStringPoint)
@@ -4043,7 +4183,7 @@ func (itr *integerReduceStringIterator) reduce() ([]StringPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -4074,6 +4214,7 @@ func (itr *integerReduceStringIterator) reduce() ([]StringPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]StringPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -4084,9 +4225,16 @@ func (itr *integerReduceStringIterator) reduce() ([]StringPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(stringPointsByTime(a)))
 	}
 
 	return a, nil
@@ -4096,6 +4244,7 @@ func (itr *integerReduceStringIterator) reduce() ([]StringPoint, error) {
 type integerStreamStringIterator struct {
 	input  *bufIntegerIterator
 	create func() (IntegerPointAggregator, StringPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*integerReduceStringPoint
 	points []StringPoint
@@ -4106,6 +4255,7 @@ func newIntegerStreamStringIterator(input IntegerIterator, createFn func() (Inte
 	return &integerStreamStringIterator{
 		input:  newBufIntegerIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*integerReduceStringPoint),
 	}
@@ -4145,7 +4295,7 @@ func (itr *integerStreamStringIterator) reduce() ([]StringPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -4294,8 +4444,18 @@ type integerStringExprFunc func(a, b int64) string
 type integerReduceBooleanIterator struct {
 	input  *bufIntegerIterator
 	create func() (IntegerPointAggregator, BooleanPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []BooleanPoint
+}
+
+func newIntegerReduceBooleanIterator(input IntegerIterator, opt IteratorOptions, createFn func() (IntegerPointAggregator, BooleanPointEmitter)) *integerReduceBooleanIterator {
+	return &integerReduceBooleanIterator{
+		input:  newBufIntegerIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -4333,11 +4493,20 @@ type integerReduceBooleanPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *integerReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*integerReduceBooleanPoint)
@@ -4351,7 +4520,7 @@ func (itr *integerReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -4382,6 +4551,7 @@ func (itr *integerReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]BooleanPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -4392,9 +4562,16 @@ func (itr *integerReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(booleanPointsByTime(a)))
 	}
 
 	return a, nil
@@ -4404,6 +4581,7 @@ func (itr *integerReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 type integerStreamBooleanIterator struct {
 	input  *bufIntegerIterator
 	create func() (IntegerPointAggregator, BooleanPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*integerReduceBooleanPoint
 	points []BooleanPoint
@@ -4414,6 +4592,7 @@ func newIntegerStreamBooleanIterator(input IntegerIterator, createFn func() (Int
 	return &integerStreamBooleanIterator{
 		input:  newBufIntegerIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*integerReduceBooleanPoint),
 	}
@@ -4453,7 +4632,7 @@ func (itr *integerStreamBooleanIterator) reduce() ([]BooleanPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -5271,10 +5450,6 @@ func (itr *stringLimitIterator) Next() (*StringPoint, error) {
 
 		// Read next point if we're beyond the limit.
 		if itr.opt.Limit > 0 && (itr.n-itr.opt.Offset) > itr.opt.Limit {
-			// If there's no interval, no groups, and a single source then simply exit.
-			if itr.opt.Interval.IsZero() && len(itr.opt.Dimensions) == 0 && len(itr.opt.Sources) == 1 {
-				return nil, nil
-			}
 			continue
 		}
 
@@ -5546,7 +5721,7 @@ type auxStringPoint struct {
 type stringAuxIterator struct {
 	input      *bufStringIterator
 	output     chan auxStringPoint
-	fields     auxIteratorFields
+	fields     *auxIteratorFields
 	background bool
 }
 
@@ -5573,28 +5748,6 @@ func (itr *stringAuxIterator) Next() (*StringPoint, error) {
 }
 func (itr *stringAuxIterator) Iterator(name string, typ DataType) Iterator {
 	return itr.fields.iterator(name, typ)
-}
-
-func (itr *stringAuxIterator) CreateIterator(opt IteratorOptions) (Iterator, error) {
-	expr := opt.Expr
-	if expr == nil {
-		panic("unable to create an iterator with no expression from an aux iterator")
-	}
-
-	switch expr := expr.(type) {
-	case *VarRef:
-		return itr.Iterator(expr.Val, expr.Type), nil
-	default:
-		panic(fmt.Sprintf("invalid expression type for an aux iterator: %T", expr))
-	}
-}
-
-func (itr *stringAuxIterator) FieldDimensions(sources Sources) (fields map[string]DataType, dimensions map[string]struct{}, err error) {
-	return nil, nil, errors.New("not implemented")
-}
-
-func (itr *stringAuxIterator) ExpandSources(sources Sources) (Sources, error) {
-	return nil, errors.New("not implemented")
 }
 
 func (itr *stringAuxIterator) stream() {
@@ -5718,8 +5871,18 @@ func (itr *stringChanIterator) Next() (*StringPoint, error) {
 type stringReduceFloatIterator struct {
 	input  *bufStringIterator
 	create func() (StringPointAggregator, FloatPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []FloatPoint
+}
+
+func newStringReduceFloatIterator(input StringIterator, opt IteratorOptions, createFn func() (StringPointAggregator, FloatPointEmitter)) *stringReduceFloatIterator {
+	return &stringReduceFloatIterator{
+		input:  newBufStringIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -5757,11 +5920,20 @@ type stringReduceFloatPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *stringReduceFloatIterator) reduce() ([]FloatPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*stringReduceFloatPoint)
@@ -5775,7 +5947,7 @@ func (itr *stringReduceFloatIterator) reduce() ([]FloatPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -5806,6 +5978,7 @@ func (itr *stringReduceFloatIterator) reduce() ([]FloatPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]FloatPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -5816,9 +5989,16 @@ func (itr *stringReduceFloatIterator) reduce() ([]FloatPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(floatPointsByTime(a)))
 	}
 
 	return a, nil
@@ -5828,6 +6008,7 @@ func (itr *stringReduceFloatIterator) reduce() ([]FloatPoint, error) {
 type stringStreamFloatIterator struct {
 	input  *bufStringIterator
 	create func() (StringPointAggregator, FloatPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*stringReduceFloatPoint
 	points []FloatPoint
@@ -5838,6 +6019,7 @@ func newStringStreamFloatIterator(input StringIterator, createFn func() (StringP
 	return &stringStreamFloatIterator{
 		input:  newBufStringIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*stringReduceFloatPoint),
 	}
@@ -5877,7 +6059,7 @@ func (itr *stringStreamFloatIterator) reduce() ([]FloatPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -6026,8 +6208,18 @@ type stringFloatExprFunc func(a, b string) float64
 type stringReduceIntegerIterator struct {
 	input  *bufStringIterator
 	create func() (StringPointAggregator, IntegerPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []IntegerPoint
+}
+
+func newStringReduceIntegerIterator(input StringIterator, opt IteratorOptions, createFn func() (StringPointAggregator, IntegerPointEmitter)) *stringReduceIntegerIterator {
+	return &stringReduceIntegerIterator{
+		input:  newBufStringIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -6065,11 +6257,20 @@ type stringReduceIntegerPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *stringReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*stringReduceIntegerPoint)
@@ -6083,7 +6284,7 @@ func (itr *stringReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -6114,6 +6315,7 @@ func (itr *stringReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]IntegerPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -6124,9 +6326,16 @@ func (itr *stringReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(integerPointsByTime(a)))
 	}
 
 	return a, nil
@@ -6136,6 +6345,7 @@ func (itr *stringReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 type stringStreamIntegerIterator struct {
 	input  *bufStringIterator
 	create func() (StringPointAggregator, IntegerPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*stringReduceIntegerPoint
 	points []IntegerPoint
@@ -6146,6 +6356,7 @@ func newStringStreamIntegerIterator(input StringIterator, createFn func() (Strin
 	return &stringStreamIntegerIterator{
 		input:  newBufStringIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*stringReduceIntegerPoint),
 	}
@@ -6185,7 +6396,7 @@ func (itr *stringStreamIntegerIterator) reduce() ([]IntegerPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -6334,8 +6545,18 @@ type stringIntegerExprFunc func(a, b string) int64
 type stringReduceStringIterator struct {
 	input  *bufStringIterator
 	create func() (StringPointAggregator, StringPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []StringPoint
+}
+
+func newStringReduceStringIterator(input StringIterator, opt IteratorOptions, createFn func() (StringPointAggregator, StringPointEmitter)) *stringReduceStringIterator {
+	return &stringReduceStringIterator{
+		input:  newBufStringIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -6373,11 +6594,20 @@ type stringReduceStringPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *stringReduceStringIterator) reduce() ([]StringPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*stringReduceStringPoint)
@@ -6391,7 +6621,7 @@ func (itr *stringReduceStringIterator) reduce() ([]StringPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -6422,6 +6652,7 @@ func (itr *stringReduceStringIterator) reduce() ([]StringPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]StringPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -6432,9 +6663,16 @@ func (itr *stringReduceStringIterator) reduce() ([]StringPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(stringPointsByTime(a)))
 	}
 
 	return a, nil
@@ -6444,6 +6682,7 @@ func (itr *stringReduceStringIterator) reduce() ([]StringPoint, error) {
 type stringStreamStringIterator struct {
 	input  *bufStringIterator
 	create func() (StringPointAggregator, StringPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*stringReduceStringPoint
 	points []StringPoint
@@ -6454,6 +6693,7 @@ func newStringStreamStringIterator(input StringIterator, createFn func() (String
 	return &stringStreamStringIterator{
 		input:  newBufStringIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*stringReduceStringPoint),
 	}
@@ -6493,7 +6733,7 @@ func (itr *stringStreamStringIterator) reduce() ([]StringPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -6638,8 +6878,18 @@ type stringExprFunc func(a, b string) string
 type stringReduceBooleanIterator struct {
 	input  *bufStringIterator
 	create func() (StringPointAggregator, BooleanPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []BooleanPoint
+}
+
+func newStringReduceBooleanIterator(input StringIterator, opt IteratorOptions, createFn func() (StringPointAggregator, BooleanPointEmitter)) *stringReduceBooleanIterator {
+	return &stringReduceBooleanIterator{
+		input:  newBufStringIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -6677,11 +6927,20 @@ type stringReduceBooleanPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *stringReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*stringReduceBooleanPoint)
@@ -6695,7 +6954,7 @@ func (itr *stringReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -6726,6 +6985,7 @@ func (itr *stringReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]BooleanPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -6736,9 +6996,16 @@ func (itr *stringReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(booleanPointsByTime(a)))
 	}
 
 	return a, nil
@@ -6748,6 +7015,7 @@ func (itr *stringReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 type stringStreamBooleanIterator struct {
 	input  *bufStringIterator
 	create func() (StringPointAggregator, BooleanPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*stringReduceBooleanPoint
 	points []BooleanPoint
@@ -6758,6 +7026,7 @@ func newStringStreamBooleanIterator(input StringIterator, createFn func() (Strin
 	return &stringStreamBooleanIterator{
 		input:  newBufStringIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*stringReduceBooleanPoint),
 	}
@@ -6797,7 +7066,7 @@ func (itr *stringStreamBooleanIterator) reduce() ([]BooleanPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -7615,10 +7884,6 @@ func (itr *booleanLimitIterator) Next() (*BooleanPoint, error) {
 
 		// Read next point if we're beyond the limit.
 		if itr.opt.Limit > 0 && (itr.n-itr.opt.Offset) > itr.opt.Limit {
-			// If there's no interval, no groups, and a single source then simply exit.
-			if itr.opt.Interval.IsZero() && len(itr.opt.Dimensions) == 0 && len(itr.opt.Sources) == 1 {
-				return nil, nil
-			}
 			continue
 		}
 
@@ -7890,7 +8155,7 @@ type auxBooleanPoint struct {
 type booleanAuxIterator struct {
 	input      *bufBooleanIterator
 	output     chan auxBooleanPoint
-	fields     auxIteratorFields
+	fields     *auxIteratorFields
 	background bool
 }
 
@@ -7917,28 +8182,6 @@ func (itr *booleanAuxIterator) Next() (*BooleanPoint, error) {
 }
 func (itr *booleanAuxIterator) Iterator(name string, typ DataType) Iterator {
 	return itr.fields.iterator(name, typ)
-}
-
-func (itr *booleanAuxIterator) CreateIterator(opt IteratorOptions) (Iterator, error) {
-	expr := opt.Expr
-	if expr == nil {
-		panic("unable to create an iterator with no expression from an aux iterator")
-	}
-
-	switch expr := expr.(type) {
-	case *VarRef:
-		return itr.Iterator(expr.Val, expr.Type), nil
-	default:
-		panic(fmt.Sprintf("invalid expression type for an aux iterator: %T", expr))
-	}
-}
-
-func (itr *booleanAuxIterator) FieldDimensions(sources Sources) (fields map[string]DataType, dimensions map[string]struct{}, err error) {
-	return nil, nil, errors.New("not implemented")
-}
-
-func (itr *booleanAuxIterator) ExpandSources(sources Sources) (Sources, error) {
-	return nil, errors.New("not implemented")
 }
 
 func (itr *booleanAuxIterator) stream() {
@@ -8062,8 +8305,18 @@ func (itr *booleanChanIterator) Next() (*BooleanPoint, error) {
 type booleanReduceFloatIterator struct {
 	input  *bufBooleanIterator
 	create func() (BooleanPointAggregator, FloatPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []FloatPoint
+}
+
+func newBooleanReduceFloatIterator(input BooleanIterator, opt IteratorOptions, createFn func() (BooleanPointAggregator, FloatPointEmitter)) *booleanReduceFloatIterator {
+	return &booleanReduceFloatIterator{
+		input:  newBufBooleanIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -8101,11 +8354,20 @@ type booleanReduceFloatPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *booleanReduceFloatIterator) reduce() ([]FloatPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*booleanReduceFloatPoint)
@@ -8119,7 +8381,7 @@ func (itr *booleanReduceFloatIterator) reduce() ([]FloatPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -8150,6 +8412,7 @@ func (itr *booleanReduceFloatIterator) reduce() ([]FloatPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]FloatPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -8160,9 +8423,16 @@ func (itr *booleanReduceFloatIterator) reduce() ([]FloatPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(floatPointsByTime(a)))
 	}
 
 	return a, nil
@@ -8172,6 +8442,7 @@ func (itr *booleanReduceFloatIterator) reduce() ([]FloatPoint, error) {
 type booleanStreamFloatIterator struct {
 	input  *bufBooleanIterator
 	create func() (BooleanPointAggregator, FloatPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*booleanReduceFloatPoint
 	points []FloatPoint
@@ -8182,6 +8453,7 @@ func newBooleanStreamFloatIterator(input BooleanIterator, createFn func() (Boole
 	return &booleanStreamFloatIterator{
 		input:  newBufBooleanIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*booleanReduceFloatPoint),
 	}
@@ -8221,7 +8493,7 @@ func (itr *booleanStreamFloatIterator) reduce() ([]FloatPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -8370,8 +8642,18 @@ type booleanFloatExprFunc func(a, b bool) float64
 type booleanReduceIntegerIterator struct {
 	input  *bufBooleanIterator
 	create func() (BooleanPointAggregator, IntegerPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []IntegerPoint
+}
+
+func newBooleanReduceIntegerIterator(input BooleanIterator, opt IteratorOptions, createFn func() (BooleanPointAggregator, IntegerPointEmitter)) *booleanReduceIntegerIterator {
+	return &booleanReduceIntegerIterator{
+		input:  newBufBooleanIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -8409,11 +8691,20 @@ type booleanReduceIntegerPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *booleanReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*booleanReduceIntegerPoint)
@@ -8427,7 +8718,7 @@ func (itr *booleanReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -8458,6 +8749,7 @@ func (itr *booleanReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]IntegerPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -8468,9 +8760,16 @@ func (itr *booleanReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(integerPointsByTime(a)))
 	}
 
 	return a, nil
@@ -8480,6 +8779,7 @@ func (itr *booleanReduceIntegerIterator) reduce() ([]IntegerPoint, error) {
 type booleanStreamIntegerIterator struct {
 	input  *bufBooleanIterator
 	create func() (BooleanPointAggregator, IntegerPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*booleanReduceIntegerPoint
 	points []IntegerPoint
@@ -8490,6 +8790,7 @@ func newBooleanStreamIntegerIterator(input BooleanIterator, createFn func() (Boo
 	return &booleanStreamIntegerIterator{
 		input:  newBufBooleanIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*booleanReduceIntegerPoint),
 	}
@@ -8529,7 +8830,7 @@ func (itr *booleanStreamIntegerIterator) reduce() ([]IntegerPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -8678,8 +8979,18 @@ type booleanIntegerExprFunc func(a, b bool) int64
 type booleanReduceStringIterator struct {
 	input  *bufBooleanIterator
 	create func() (BooleanPointAggregator, StringPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []StringPoint
+}
+
+func newBooleanReduceStringIterator(input BooleanIterator, opt IteratorOptions, createFn func() (BooleanPointAggregator, StringPointEmitter)) *booleanReduceStringIterator {
+	return &booleanReduceStringIterator{
+		input:  newBufBooleanIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -8717,11 +9028,20 @@ type booleanReduceStringPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *booleanReduceStringIterator) reduce() ([]StringPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*booleanReduceStringPoint)
@@ -8735,7 +9055,7 @@ func (itr *booleanReduceStringIterator) reduce() ([]StringPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -8766,6 +9086,7 @@ func (itr *booleanReduceStringIterator) reduce() ([]StringPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]StringPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -8776,9 +9097,16 @@ func (itr *booleanReduceStringIterator) reduce() ([]StringPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(stringPointsByTime(a)))
 	}
 
 	return a, nil
@@ -8788,6 +9116,7 @@ func (itr *booleanReduceStringIterator) reduce() ([]StringPoint, error) {
 type booleanStreamStringIterator struct {
 	input  *bufBooleanIterator
 	create func() (BooleanPointAggregator, StringPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*booleanReduceStringPoint
 	points []StringPoint
@@ -8798,6 +9127,7 @@ func newBooleanStreamStringIterator(input BooleanIterator, createFn func() (Bool
 	return &booleanStreamStringIterator{
 		input:  newBufBooleanIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*booleanReduceStringPoint),
 	}
@@ -8837,7 +9167,7 @@ func (itr *booleanStreamStringIterator) reduce() ([]StringPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -8986,8 +9316,18 @@ type booleanStringExprFunc func(a, b bool) string
 type booleanReduceBooleanIterator struct {
 	input  *bufBooleanIterator
 	create func() (BooleanPointAggregator, BooleanPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	points []BooleanPoint
+}
+
+func newBooleanReduceBooleanIterator(input BooleanIterator, opt IteratorOptions, createFn func() (BooleanPointAggregator, BooleanPointEmitter)) *booleanReduceBooleanIterator {
+	return &booleanReduceBooleanIterator{
+		input:  newBufBooleanIterator(input),
+		create: createFn,
+		dims:   opt.GetDimensions(),
+		opt:    opt,
+	}
 }
 
 // Stats returns stats from the input iterator.
@@ -9025,11 +9365,20 @@ type booleanReduceBooleanPoint struct {
 // The previous value for the dimension is passed to fn.
 func (itr *booleanReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 	// Calculate next window.
-	t, err := itr.input.peekTime()
-	if err != nil {
-		return nil, err
+	var startTime, endTime int64
+	for {
+		p, err := itr.input.Next()
+		if err != nil || p == nil {
+			return nil, err
+		} else if p.Nil {
+			continue
+		}
+
+		// Unread the point so it can be processed.
+		itr.input.unread(p)
+		startTime, endTime = itr.opt.Window(p.Time)
+		break
 	}
-	startTime, endTime := itr.opt.Window(t)
 
 	// Create points by tags.
 	m := make(map[string]*booleanReduceBooleanPoint)
@@ -9043,7 +9392,7 @@ func (itr *booleanReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {
@@ -9074,6 +9423,7 @@ func (itr *booleanReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 		sort.Sort(reverseStringSlice(keys))
 	}
 
+	sortByTime := false
 	a := make([]BooleanPoint, 0, len(m))
 	for _, k := range keys {
 		rp := m[k]
@@ -9084,9 +9434,16 @@ func (itr *booleanReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 			// Set the points time to the interval time if the reducer didn't provide one.
 			if points[i].Time == ZeroTime {
 				points[i].Time = startTime
+			} else {
+				sortByTime = true
 			}
 			a = append(a, points[i])
 		}
+	}
+
+	// Points may be out of order. Perform a stable sort by time if requested.
+	if sortByTime && itr.opt.Ordered {
+		sort.Stable(sort.Reverse(booleanPointsByTime(a)))
 	}
 
 	return a, nil
@@ -9096,6 +9453,7 @@ func (itr *booleanReduceBooleanIterator) reduce() ([]BooleanPoint, error) {
 type booleanStreamBooleanIterator struct {
 	input  *bufBooleanIterator
 	create func() (BooleanPointAggregator, BooleanPointEmitter)
+	dims   []string
 	opt    IteratorOptions
 	m      map[string]*booleanReduceBooleanPoint
 	points []BooleanPoint
@@ -9106,6 +9464,7 @@ func newBooleanStreamBooleanIterator(input BooleanIterator, createFn func() (Boo
 	return &booleanStreamBooleanIterator{
 		input:  newBufBooleanIterator(input),
 		create: createFn,
+		dims:   opt.GetDimensions(),
 		opt:    opt,
 		m:      make(map[string]*booleanReduceBooleanPoint),
 	}
@@ -9145,7 +9504,7 @@ func (itr *booleanStreamBooleanIterator) reduce() ([]BooleanPoint, error) {
 		} else if curr.Nil {
 			continue
 		}
-		tags := curr.Tags.Subset(itr.opt.Dimensions)
+		tags := curr.Tags.Subset(itr.dims)
 
 		id := curr.Name
 		if len(tags.m) > 0 {

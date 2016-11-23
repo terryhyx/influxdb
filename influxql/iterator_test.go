@@ -6,7 +6,6 @@ import (
 	"math"
 	"math/rand"
 	"reflect"
-	"regexp"
 	"testing"
 	"time"
 
@@ -832,26 +831,6 @@ func TestIteratorOptions_SeekTime_Descending(t *testing.T) {
 	}
 }
 
-func TestIteratorOptions_MergeSorted(t *testing.T) {
-	opt := influxql.IteratorOptions{}
-	sorted := opt.MergeSorted()
-	if !sorted {
-		t.Error("expected no expression to be sorted, got unsorted")
-	}
-
-	opt.Expr = &influxql.VarRef{}
-	sorted = opt.MergeSorted()
-	if !sorted {
-		t.Error("expected expression with varref to be sorted, got unsorted")
-	}
-
-	opt.Expr = &influxql.Call{}
-	sorted = opt.MergeSorted()
-	if sorted {
-		t.Error("expected expression without varref to be unsorted, got sorted")
-	}
-}
-
 func TestIteratorOptions_DerivativeInterval_Default(t *testing.T) {
 	opt := influxql.IteratorOptions{}
 	expected := influxql.Interval{Duration: time.Second}
@@ -945,9 +924,6 @@ func TestIteratorOptions_MarshalBinary(t *testing.T) {
 	opt := &influxql.IteratorOptions{
 		Expr: MustParseExpr("count(value)"),
 		Aux:  []influxql.VarRef{{Val: "a"}, {Val: "b"}, {Val: "c"}},
-		Sources: []influxql.Source{
-			&influxql.Measurement{Database: "db0", RetentionPolicy: "rp0", Name: "mm0"},
-		},
 		Interval: influxql.Interval{
 			Duration: 1 * time.Hour,
 			Offset:   20 * time.Minute,
@@ -978,29 +954,6 @@ func TestIteratorOptions_MarshalBinary(t *testing.T) {
 		t.Fatal(err)
 	} else if !reflect.DeepEqual(&other, opt) {
 		t.Fatalf("unexpected options: %s", spew.Sdump(other))
-	}
-}
-
-// Ensure iterator options with a regex measurement can be marshaled.
-func TestIteratorOptions_MarshalBinary_Measurement_Regex(t *testing.T) {
-	opt := &influxql.IteratorOptions{
-		Sources: []influxql.Source{
-			&influxql.Measurement{Database: "db1", RetentionPolicy: "rp2", Regex: &influxql.RegexLiteral{Val: regexp.MustCompile(`series.+`)}},
-		},
-	}
-
-	// Marshal to binary.
-	buf, err := opt.MarshalBinary()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Unmarshal back to an object.
-	var other influxql.IteratorOptions
-	if err := other.UnmarshalBinary(buf); err != nil {
-		t.Fatal(err)
-	} else if v := other.Sources[0].(*influxql.Measurement).Regex.Val.String(); v != `series.+` {
-		t.Fatalf("unexpected measurement regex: %s", v)
 	}
 }
 
@@ -1056,21 +1009,31 @@ func TestIterator_EncodeDecode(t *testing.T) {
 
 // IteratorCreator is a mockable implementation of SelectStatementExecutor.IteratorCreator.
 type IteratorCreator struct {
-	CreateIteratorFn  func(opt influxql.IteratorOptions) (influxql.Iterator, error)
-	FieldDimensionsFn func(sources influxql.Sources) (fields map[string]influxql.DataType, dimensions map[string]struct{}, err error)
-	ExpandSourcesFn   func(sources influxql.Sources) (influxql.Sources, error)
+	CreateIteratorFn  func(m *influxql.Measurement, opt influxql.IteratorOptions) (influxql.Iterator, error)
+	FieldDimensionsFn func(m *influxql.Measurement) (fields map[string]influxql.DataType, dimensions map[string]struct{}, err error)
 }
 
-func (ic *IteratorCreator) CreateIterator(opt influxql.IteratorOptions) (influxql.Iterator, error) {
-	return ic.CreateIteratorFn(opt)
+func (ic *IteratorCreator) CreateIterator(m *influxql.Measurement, opt influxql.IteratorOptions) (influxql.Iterator, error) {
+	return ic.CreateIteratorFn(m, opt)
 }
 
-func (ic *IteratorCreator) FieldDimensions(sources influxql.Sources) (fields map[string]influxql.DataType, dimensions map[string]struct{}, err error) {
-	return ic.FieldDimensionsFn(sources)
+func (ic *IteratorCreator) FieldDimensions(m *influxql.Measurement) (fields map[string]influxql.DataType, dimensions map[string]struct{}, err error) {
+	return ic.FieldDimensionsFn(m)
 }
 
-func (ic *IteratorCreator) ExpandSources(sources influxql.Sources) (influxql.Sources, error) {
-	return ic.ExpandSourcesFn(sources)
+func (ic *IteratorCreator) MapType(m *influxql.Measurement, field string) influxql.DataType {
+	f, d, err := ic.FieldDimensions(m)
+	if err != nil {
+		return influxql.Unknown
+	}
+
+	if typ, ok := f[field]; ok {
+		return typ
+	}
+	if _, ok := d[field]; ok {
+		return influxql.Tag
+	}
+	return influxql.Unknown
 }
 
 // Test implementation of influxql.FloatIterator
