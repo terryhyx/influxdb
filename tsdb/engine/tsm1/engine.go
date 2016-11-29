@@ -298,10 +298,6 @@ func (e *Engine) MeasurementFields(measurement string) *tsdb.MeasurementFields {
 	return e.fieldset.CreateFieldsIfNotExists(measurement)
 }
 
-func (e *Engine) SeriesN() (uint64, error) {
-	return e.index.SeriesN()
-}
-
 func (e *Engine) ForEachMeasurementSeriesByExpr(name []byte, condition influxql.Expr, fn func(tags models.Tags) error) error {
 	return e.index.ForEachMeasurementSeriesByExpr(name, condition, fn)
 }

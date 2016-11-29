@@ -226,7 +226,8 @@ func (i *Index) ForEachMeasurement(fn func(name []byte) error) error {
 	return nil
 }
 
-// MeasurementSeriesIterator returns an iterator over all series in the index.
+// MeasurementSeriesIterator returns an iterator over all non-tombstoned series
+// in the index for the provided measurement.
 func (i *Index) MeasurementSeriesIterator(name []byte) SeriesIterator {
 	a := make([]SeriesIterator, 0, i.FileN())
 	for _, f := range i.files() {
@@ -473,9 +474,12 @@ func (i *Index) DropMeasurement(name []byte) error {
 
 // CreateSeriesIfNotExists creates a series if it doesn't exist or is deleted.
 func (i *Index) CreateSeriesIfNotExists(key, name []byte, tags models.Tags) error {
+	// FIXME: this should be something like HasSeries
 	if e := i.Series(name, tags); e != nil {
 		return nil
 	}
+
+	// FIXME(edd): check for series count.
 	return i.logFiles[0].AddSeries(name, tags)
 }
 
@@ -496,18 +500,28 @@ func (i *Index) DropSeries(keys [][]byte) error {
 			return err
 		}
 
-		if err := i.logFiles[0].DeleteSeries([]byte(name), tags); err != nil {
+		mname := []byte(name)
+		if err := i.logFiles[0].DeleteSeries(mname, tags); err != nil {
 			return err
+		}
+
+		// Check if that was the last series for the measurement in the entire
+		// index.
+		itr := i.MeasurementSeriesIterator(mname)
+		last := true
+		if itr.Next() != nil {
+			last = false
+		}
+
+		// There are no series in the index so the measurement has been
+		// tombstoned.
+		if last {
+			if err := i.logFiles[0].mTSketch.Add(mname); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
-}
-
-func (i *Index) SeriesN() (n uint64, err error) {
-	// FIXME(edd): Use sketches.
-
-	// HACK(benbjohnson): Use first log file until edd adds sketches.
-	return i.logFiles[0].SeriesN(), nil
 }
 
 func (i *Index) sketches(nextSketches func(*IndexFile) (estimator.Sketch, estimator.Sketch)) (estimator.Sketch, estimator.Sketch, error) {

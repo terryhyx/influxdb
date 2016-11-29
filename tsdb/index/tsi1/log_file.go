@@ -461,18 +461,13 @@ func (f *LogFile) execSeriesEntry(e *LogEntry) {
 	f.mms[string(e.Name)] = mm
 
 	// Update the sketches...
-
 	if deleted {
 		f.sTSketch.Add(models.MakeKey(e.Name, e.Tags)) // Deleting series so update tombstone sketch.
-
-		// TODO(edd): If this is the last series in the measurement, how will
-		// we update the measurement tombstone sketch?
-		// f.mTSketch.Add([]byte("FIXME"))
 		return
 	}
 
 	f.sSketch.Add(models.MakeKey(e.Name, e.Tags)) // Add series to sketch.
-	f.mSketch.Add(e.Name)                         // Add measurement to sketch.
+	f.mSketch.Add(e.Name)                         // Add measurement to sketch as this may be the fist series for the measurement.
 }
 
 // SeriesIterator returns an iterator over all series in the log file.
