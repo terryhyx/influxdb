@@ -390,8 +390,8 @@ func TestHoltWinters_MaxTime(t *testing.T) {
 // TestSample_AllSamplesSeen attempts to verify that it is possible
 // to get every subsample in a reasonable number of iterations.
 //
-// The idea here is that 6 iterations should be enough to hit every possible
-// sequence atleast once.
+// The idea here is that 24 iterations should be enough to hit every possible
+// sequence at least once.
 func TestSample_AllSamplesSeen(t *testing.T) {
 
 	ps := []influxql.FloatPoint{
@@ -416,9 +416,9 @@ func TestSample_AllSamplesSeen(t *testing.T) {
 		},
 	}
 
-	// 6 iterations should be more than sufficient to garentee that
+	// 24 iterations should be sufficient to guarantee that
 	// we hit every possible subsample.
-	for i := 0; i < 6; i++ {
+	for i := 0; i < 24; i++ {
 		s := influxql.NewFloatSampleReducer(2)
 		for _, p := range ps {
 			s.AggregateFloat(&p)
@@ -438,14 +438,12 @@ func TestSample_AllSamplesSeen(t *testing.T) {
 				samples = append(samples[:i], samples[i+1:]...)
 			}
 		}
-
 	}
 
 	// If we missed a sample, report the error
 	if exp, got := 0, len(samples); exp != got {
 		t.Fatalf("expected to get every sample: got %d, exp %d", got, exp)
 	}
-
 }
 
 func TestSample_SampleSizeLessThanNumPoints(t *testing.T) {
